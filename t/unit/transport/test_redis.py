@@ -1732,16 +1732,51 @@ class test_Channel:
                 raise chan.connection_errors[0]('connection lost')
         chan.queue_delete = queue_delete
         transport = chan.connection
+
+        # Keep an actual unacked delivery in QoS. The real
+        # restore_unacked_once()/restore_unacked() path must build its pool
+        # while the transport still has its Connection client attached.
+        delivery_tag = 'late-ack-tag'
+        chan.qos._delivered[delivery_tag] = Mock()
         restored_with = []
-        chan.qos.restore_unacked_once = Mock(
-            side_effect=lambda: restored_with.append(transport.client))
+
+        def restore_by_tag(tag, client=None, leftmost=False):
+            restored_with.append((tag, transport.client, client))
+
+        chan.qos.restore_by_tag = restore_by_tag
+
+        # Use the production Redis pool builder for this test. The normal
+        # test Channel uses a lightweight _get_pool stub, which would hide
+        # an attempt to read connection parameters after collect() detaches
+        # the transport.
+        chan._get_pool = lambda asynchronous=False: redis.Channel._get_pool(
+            chan, asynchronous=asynchronous,
+        )
 
         self.connection.collect()
         server_down = False
         self.connection.close()
 
         assert chan.closed
-        assert restored_with == [self.connection]
+        assert len(restored_with) == 1
+        restored_tag, attached_client, restore_client = restored_with[0]
+        assert restored_tag == delivery_tag
+        assert attached_client is self.connection
+        assert restore_client is not None
+
+        # The close-time restore built a pool before collect() detached the
+        # transport. A late ack must be able to reuse that pool afterwards
+        # rather than trying to rebuild it from transport.client == None.
+        pool = chan._pool
+        assert pool is not None
+        assert 'host' in pool.connection_kwargs
+        assert transport.client is None
+
+        def unexpected_pool_rebuild(asynchronous=False):
+            pytest.fail('late ack tried to rebuild a pool after collect()')
+
+        chan._get_pool = unexpected_pool_rebuild
+        chan.qos.ack(delivery_tag)
 
     def test_invalid_database_raises_ValueError(self):
 
