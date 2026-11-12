@@ -1700,6 +1700,84 @@ class test_Channel:
         self.channel.close()
         connection.disconnect.assert_called_with()
 
+    def test_close_when_in_poll_read_fails(self):
+        chan = self.channel
+        chan._in_poll = True
+
+        def _brpop_read(**options):
+            chan._in_poll = None
+            raise chan.connection_errors[0]('connection lost')
+        chan._brpop_read = _brpop_read
+        cycle = chan.connection.cycle
+
+        chan.close()
+
+        assert chan.closed
+        assert chan not in cycle._channels
+
+    def test_close_after_collect_while_server_is_down(self):
+        # celery/celery#11054: after a connection error the worker calls
+        # collect() and then close().  Deleting the fanout bindings failed
+        # while the server was down, which left the channel open, so the
+        # close() after the server came back restored unacked messages
+        # through the transport collect() had detached.
+        chan = self.channel
+        chan._fanout_queues = {'foo': ('foo', '')}
+        chan.auto_delete_queues = ['foo']
+        chan.client
+        server_down = True
+
+        def queue_delete(queue, client=None):
+            if server_down:
+                raise chan.connection_errors[0]('connection lost')
+        chan.queue_delete = queue_delete
+        transport = chan.connection
+
+        # Keep an actual unacked delivery in QoS. The real
+        # restore_unacked_once()/restore_unacked() path must build its pool
+        # while the transport still has its Connection client attached.
+        delivery_tag = 'late-ack-tag'
+        chan.qos._delivered[delivery_tag] = Mock()
+        restored_with = []
+
+        def restore_by_tag(tag, client=None, leftmost=False):
+            restored_with.append((tag, transport.client, client))
+
+        chan.qos.restore_by_tag = restore_by_tag
+
+        # Use the production Redis pool builder for this test. The normal
+        # test Channel uses a lightweight _get_pool stub, which would hide
+        # an attempt to read connection parameters after collect() detaches
+        # the transport.
+        chan._get_pool = lambda asynchronous=False: redis.Channel._get_pool(
+            chan, asynchronous=asynchronous,
+        )
+
+        self.connection.collect()
+        server_down = False
+        self.connection.close()
+
+        assert chan.closed
+        assert len(restored_with) == 1
+        restored_tag, attached_client, restore_client = restored_with[0]
+        assert restored_tag == delivery_tag
+        assert attached_client is self.connection
+        assert restore_client is not None
+
+        # The close-time restore built a pool before collect() detached the
+        # transport. A late ack must be able to reuse that pool afterwards
+        # rather than trying to rebuild it from transport.client == None.
+        pool = chan._pool
+        assert pool is not None
+        assert 'host' in pool.connection_kwargs
+        assert transport.client is None
+
+        def unexpected_pool_rebuild(asynchronous=False):
+            pytest.fail('late ack tried to rebuild a pool after collect()')
+
+        chan._get_pool = unexpected_pool_rebuild
+        chan.qos.ack(delivery_tag)
+
     def test_invalid_database_raises_ValueError(self):
 
         with pytest.raises(ValueError):
